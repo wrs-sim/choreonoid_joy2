@@ -3,77 +3,108 @@
     @author Kenta Suzuki
 */
 
-#include <chrono>
-#include <functional>
+#include <cnoid/Joystick>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/joy.hpp>
+#include <iostream>
 #include <memory>
 #include <string>
 
-#include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/joy.hpp>
+using namespace std::chrono_literals;
 
-#include <cnoid/Joystick>
-#include <unistd.h>
+class Choreonoid2JoyNode : public rclcpp::Node
+{
+public:
+    Choreonoid2JoyNode()
+        : Node("choreonoid_joy2")
+    {
+        // 1. Declare parameters with default values
+        this->declare_parameter<std::string>("device_name", "/dev/input/js0");
+        this->declare_parameter<std::string>("topic_name", "joy");
 
-int main(int argc, char* argv[])
+        // 2. Retrieve parameter values
+        std::string device_path = this->get_parameter("device_name").as_string();
+        std::string topic_name = this->get_parameter("topic_name").as_string();
+
+        // Initialize the Choreonoid Joystick
+        joystick_ = std::make_unique<cnoid::Joystick>(device_path.c_str());
+
+        // Create publisher using the topic name from parameters
+        publisher_ = this->create_publisher<sensor_msgs::msg::Joy>(topic_name, 10);
+
+        // Set up signal connections (callbacks for state changes)
+        joystick_->sigButton().connect([this](int, bool) { state_changed_ = true; });
+        joystick_->sigAxis().connect([this](int, double) { state_changed_ = true; });
+
+        // Set up the main loop timer (60Hz / approx 16.6ms)
+        timer_ = this->create_wall_timer(16.6ms, std::bind(&Choreonoid2JoyNode::update, this));
+
+        RCLCPP_INFO(
+            this->get_logger(), "Node initialized with device: %s, topic: %s", device_path.c_str(), topic_name.c_str());
+    }
+
+private:
+    void update()
+    {
+        // Check if the joystick device is ready
+        if(!joystick_->isReady()) {
+            if(!joystick_->makeReady()) {
+                // Throttled warning to avoid flooding the console (once every 1000ms)
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 1000, "Joystick is not ready. Retrying...");
+                return;
+            }
+        }
+
+        // Print readiness message once after initial connection
+        if(is_before_initial_reading_) {
+            RCLCPP_INFO(this->get_logger(), "Joystick \"%s\" is ready.", joystick_->device().c_str());
+            is_before_initial_reading_ = false;
+        }
+
+        // Poll the hardware state
+        joystick_->readCurrentState();
+
+        // Only publish if a button or axis state has changed
+        if(state_changed_) {
+            auto joy_msg = std::make_unique<sensor_msgs::msg::Joy>();
+
+            // Note: joy.header.seq is deprecated/removed in ROS 2
+            joy_msg->header.stamp = this->now();
+            joy_msg->header.frame_id = "joy";
+
+            // Copy axis data
+            int num_axes = joystick_->numAxes();
+            joy_msg->axes.resize(num_axes);
+            for(int i = 0; i < num_axes; ++i) {
+                joy_msg->axes[i] = static_cast<float>(joystick_->getPosition(i));
+            }
+
+            // Copy button data
+            int num_buttons = joystick_->numButtons();
+            joy_msg->buttons.resize(num_buttons);
+            for(int i = 0; i < num_buttons; ++i) {
+                joy_msg->buttons[i] = joystick_->getButtonState(i) ? 1 : 0;
+            }
+
+            // Publish the message and reset the change flag
+            publisher_->publish(std::move(joy_msg));
+            state_changed_ = false;
+        }
+    }
+
+    std::unique_ptr<cnoid::Joystick> joystick_;
+    rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr publisher_;
+    rclcpp::TimerBase::SharedPtr timer_;
+    bool state_changed_ = false;
+    bool is_before_initial_reading_ = true;
+};
+
+int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
-
-    std::string device = "/dev/input/js0";
-    // cnoid::Joystick joystick(device.c_str());
-
-    rclcpp::Node::SharedPtr node  = std::make_shared<rclcpp::Node>("joy_topic_publisher");
-    node->declare_parameter("device_name", device.c_str());
-    node->declare_parameter("topic_name", "joy");
-    std::string device_name = node->get_parameter("device_name").as_string();
-    std::string topic_name = node->get_parameter("topic_name").as_string();
-    cnoid::Joystick joystick(device_name.c_str());
-    rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr publisher = node->create_publisher<sensor_msgs::msg::Joy>(topic_name.c_str(), 30);
-
-    // rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr publisher = node->create_publisher<sensor_msgs::msg::Joy>("joy", 30);
-    rclcpp::WallRate loop_rate(60);
-    bool stateChanged = false;
-
-    joystick.sigButton().connect(
-        [&](int, bool){ stateChanged = true; });
-    joystick.sigAxis().connect(
-        [&](int, double){ stateChanged = true; });
-
-    if(!joystick.isReady()) {
-        RCLCPP_INFO(node->get_logger(), "Joystick is not ready.");
-        return -1;
-    }
-    bool isBeforeInitialReading = true;
-
-    while(rclcpp::ok()) {
-        if(!joystick.isReady()) {
-            if(!joystick.makeReady()) {
-                usleep(500000);
-                continue;
-            }
-        }
-        if(isBeforeInitialReading) {
-            RCLCPP_INFO(node->get_logger(), "Joystick \"%s\" is ready.", joystick.device().c_str());
-            isBeforeInitialReading = false;
-        }
-        joystick.readCurrentState();
-        if(stateChanged) {
-            auto joy = sensor_msgs::msg::Joy();
-            joy.header.stamp = node->get_clock()->now();
-            const int numAxes = joystick.numAxes();
-            joy.axes.resize(numAxes);
-            for(int i = 0; i < numAxes; ++i) {
-                joy.axes[i] = joystick.getPosition(i);
-            }
-            const int numButtons = joystick.numButtons();
-            joy.buttons.resize(numButtons);
-            for(int i = 0; i < numButtons; ++i) {
-                joy.buttons[i] = joystick.getButtonState(i) ? 1 : 0;
-            }
-            publisher->publish(joy);
-            stateChanged = false;
-        }
-        loop_rate.sleep();
-    }
+    auto node = std::make_shared<Choreonoid2JoyNode>();
+    rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }
